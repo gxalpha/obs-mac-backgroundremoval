@@ -1,0 +1,44 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform texture2d mask;
+uniform float threshold;
+
+sampler_state texSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float2 uv  : TEXCOORD0;
+	float4 pos : POSITION;
+};
+
+struct FragData {
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.uv = v_in.uv;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.), ViewProj);
+	return v_out;
+}
+
+float4 PSMask(FragData f_in) : TARGET
+{
+	float4 rgba = image.Sample(texSampler, f_in.uv);
+	rgba *= smoothstep(threshold - 0.1,threshold,mask.Sample(texSampler, f_in.uv).a);
+	return rgba;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSMask(f_in);
+	}
+}
