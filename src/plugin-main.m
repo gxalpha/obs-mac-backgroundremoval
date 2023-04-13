@@ -46,7 +46,7 @@ struct vision_data {
 	os_sem_t *destroyed;
 };
 
-static const char *vision_get_name()
+static const char *vision_get_name(void *)
 {
 	return obs_module_text("Name");
 }
