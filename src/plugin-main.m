@@ -38,12 +38,8 @@ struct vision_data {
 	gs_texture_t *mask_texture;
 
 	dispatch_queue_t mask_queue;
-	volatile bool frame_needs_processing;
-	CVPixelBufferRef pixelBufferIn;
+	pthread_mutex_t pixelBufferMutex;
 	CVPixelBufferRef pixelBufferOut;
-
-	volatile bool destroying;
-	os_sem_t *destroyed;
 };
 
 static const char *vision_get_name(void *)
@@ -97,45 +93,63 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
 	}
 	enum gs_color_format format = gs_texture_get_color_format(source_texture);
 
-	/* STEP THREE: Create new mask */
-	if (!os_atomic_load_bool(&filter->frame_needs_processing)) {
+	/* STEP THREE: Creation of new mask */
+	/* STEP THREE point one: Create new pixel buffer from source texture */
+	gs_stagesurf_t *stagesurf = gs_stagesurface_create(width, height, format);
+	gs_stage_texture(stagesurf, source_texture);
+	uint8_t *data;
+	uint32_t linesize;
+	gs_stagesurface_map(stagesurf, &data, &linesize);
+	gs_stagesurface_destroy(stagesurf);
+	CVPixelBufferRef pixelBufferIn;
+	CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, data, linesize, nil,
+				     nil, nil, &pixelBufferIn);
 
-		/* STEP THREE point one: Destroy old mask texture */
-		if (filter->mask_texture)
-			gs_texture_destroy(filter->mask_texture);
+	/* STEP THREE point two: Dispatch creation of new mask */
+	dispatch_async(filter->mask_queue, ^{
+		filter->request.qualityLevel = filter->qualityLevel;
 
-		/* STEP THREE point two: Get mask texture from pixel buffer */
-		if (filter->pixelBufferOut) {
-			CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
-			const uint8_t *base_address = CVPixelBufferGetBaseAddress(filter->pixelBufferOut);
-			filter->mask_texture = gs_texture_create(
-				(uint32_t)CVPixelBufferGetWidth(filter->pixelBufferOut),
-				(uint32_t)CVPixelBufferGetHeight(filter->pixelBufferOut), GS_A8, 1, &base_address, 0);
-			CVPixelBufferUnlockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
-		}
+		NSDictionary *empty = [[NSDictionary alloc] init];
+		VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBufferIn
+											      options:empty];
 
-		/* STEP THREE point three: Create new pixel buffer from source texture */
-		gs_stagesurf_t *stagesurf = gs_stagesurface_create(width, height, format);
-		gs_stage_texture(stagesurf, source_texture);
-		uint8_t *data;
-		uint32_t linesize;
-		gs_stagesurface_map(stagesurf, &data, &linesize);
-		gs_stagesurface_destroy(stagesurf);
-		CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, data,
-					     linesize, nil, nil, nil, &filter->pixelBufferIn);
+		NSArray *requests = [[NSArray alloc] initWithObjects:filter->request, nil];
+		[handler performRequests:requests error:nil];
+		pthread_mutex_lock(&filter->pixelBufferMutex);
+		if (filter->pixelBufferOut)
+			CVPixelBufferRelease(filter->pixelBufferOut);
+		filter->pixelBufferOut = filter->request.results.firstObject.pixelBuffer;
+		CVPixelBufferRetain(filter->pixelBufferOut);
+		pthread_mutex_unlock(&filter->pixelBufferMutex);
+		CVPixelBufferRelease(pixelBufferIn);
+		[empty release];
+		[handler release];
+		[requests release];
+	});
 
-		/* STEP THREE point four: Tell mask queue that a new frame can be processed */
-		os_atomic_set_bool(&filter->frame_needs_processing, true);
-	}
-
-	/* Don't render if the mask texture doesn't exist, like before the first frame is processed */
-	if (!filter->mask_texture) {
+	/* Don't render if the output pixel buffer doesn't exist, like before the first frame is processed */
+	if (!filter->pixelBufferOut) {
 		obs_source_skip_video_filter(filter->context);
 		gs_texrender_destroy(render);
 		return;
 	}
 
-	/* STEP FOUR: Render result */
+	/* STEP FOUR: Retrieve new mask texture */
+	/* STEP FOUR point one: Destroy old mask texture */
+	if (filter->mask_texture)
+		gs_texture_destroy(filter->mask_texture);
+
+	/* STEP FOUR point two: Get mask texture from pixel buffer */
+	pthread_mutex_lock(&filter->pixelBufferMutex);
+	CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
+	const uint8_t *base_address = CVPixelBufferGetBaseAddress(filter->pixelBufferOut);
+	filter->mask_texture = gs_texture_create((uint32_t)CVPixelBufferGetWidth(filter->pixelBufferOut),
+						 (uint32_t)CVPixelBufferGetHeight(filter->pixelBufferOut), GS_A8, 1,
+						 &base_address, 0);
+	CVPixelBufferUnlockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
+	pthread_mutex_unlock(&filter->pixelBufferMutex);
+
+	/* STEP FIVE: Render result */
 	if (obs_source_process_filter_begin(filter->context, format, OBS_ALLOW_DIRECT_RENDERING)) {
 		gs_effect_set_texture_srgb(filter->src_param, source_texture);
 		gs_effect_set_texture_srgb(filter->mask_param, filter->mask_texture);
@@ -183,44 +197,12 @@ static void *vision_create(obs_data_t *settings, struct obs_source *source)
 	struct vision_data *filter = bzalloc(sizeof(struct vision_data));
 	filter->context = source;
 	filter->request = [[VNGeneratePersonSegmentationRequest alloc] init];
-	os_sem_init(&filter->destroyed, 0);
+	pthread_mutex_init(&filter->pixelBufferMutex, NULL);
 
 	/* Performing the segmentation in realtime takes too long and will lag OBS, especially at higher
 	 * quality modes. As such, defer it to a different thread. This will make the mask lag behind a few
 	 * frames, but is better than lagging the graphics thread. */
-	/* TODO: There is still some room for optimization here. We currently wait for one image to be
-	 * done processing before starting the next, which means the mask isn't as up-to-date as it
-	 * theoretically could be if every image was processed. But that might involve creating a new queue
-	 * for every frame which is a story for another day. */
 	filter->mask_queue = dispatch_queue_create("Filter mask dispatch queue", NULL);
-	dispatch_async(filter->mask_queue, ^{
-		for (;;) {
-			if (os_atomic_load_bool(&filter->destroying)) {
-				os_sem_post(filter->destroyed);
-				return;
-			}
-
-			if (!os_atomic_load_bool(&filter->frame_needs_processing))
-				continue;
-
-			filter->request.qualityLevel = filter->qualityLevel;
-
-			NSDictionary *empty = [[NSDictionary alloc] init];
-			VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
-				initWithCVPixelBuffer:filter->pixelBufferIn
-					      options:empty];
-
-			NSArray *requests = [[NSArray alloc] initWithObjects:filter->request, nil];
-			[handler performRequests:requests error:nil];
-			filter->pixelBufferOut = filter->request.results.firstObject.pixelBuffer;
-			CVPixelBufferRelease(filter->pixelBufferIn);
-			[empty release];
-			[handler release];
-			[requests release];
-
-			os_atomic_set_bool(&filter->frame_needs_processing, false);
-		}
-	});
 
 	obs_enter_graphics();
 	char *file = obs_module_file("alpha_mask.effect");
@@ -237,11 +219,6 @@ static void *vision_create(obs_data_t *settings, struct obs_source *source)
 static void vision_destroy(void *filter_ptr)
 {
 	struct vision_data *filter = filter_ptr;
-
-	/* Wait for mask_queue to be done */
-	os_atomic_set_bool(&filter->destroying, true);
-	os_sem_wait(filter->destroyed);
-	os_sem_destroy(filter->destroyed);
 
 	if (filter->mask_texture) {
 		obs_enter_graphics();
