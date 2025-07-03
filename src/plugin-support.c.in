@@ -121,7 +121,7 @@ void obs_log_with_metrics(int log_level, const char *function_name,
         
         va_list args;
         va_start(args, format);
-        obs_log(log_level, enhanced_format, args);
+        blogva(log_level, enhanced_format, args);
         va_end(args);
         
         free(enhanced_format);
@@ -129,7 +129,7 @@ void obs_log_with_metrics(int log_level, const char *function_name,
         // Fallback to regular logging
         va_list args;
         va_start(args, format);
-        obs_log(log_level, format, args);
+        blogva(log_level, format, args);
         va_end(args);
     }
 }

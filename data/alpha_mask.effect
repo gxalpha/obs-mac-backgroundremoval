@@ -4,6 +4,7 @@
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform texture2d mask;
+uniform float2 texture_size;
 
 // Enhanced parameters for better control
 uniform float threshold = 0.5;
@@ -169,7 +170,7 @@ float4 PSMaskQuality(FragmentData f_in) : TARGET
 	float4 image_color = image.Sample(texSampler, uv);
 	
 	// Multi-sample mask for better edge quality
-	float2 texel_size = 1.0 / float2(1920, 1080); // Approximate, could be uniform
+	float2 texel_size = 1.0 / texture_size;
 	float mask_center = mask.Sample(maskSampler, uv).a;
 	float mask_up = mask.Sample(maskSampler, uv + float2(0, -texel_size.y)).a;
 	float mask_down = mask.Sample(maskSampler, uv + float2(0, texel_size.y)).a;

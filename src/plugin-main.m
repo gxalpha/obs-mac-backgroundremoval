@@ -446,7 +446,7 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
     // Process segmentation asynchronously if not already processing
     bool expected = false;
     if (atomic_compare_exchange_strong(&filter->processing_active, &expected, true)) {
-        uint64_t frame_number = atomic_fetch_add(&filter->frame_counter, 1);
+        atomic_fetch_add(&filter->frame_counter, 1);
         
         // Use high-priority queue for real-time processing
         dispatch_async(filter->high_priority_queue, ^{

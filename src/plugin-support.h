@@ -71,11 +71,11 @@ void obs_log_with_metrics(int log_level, const char *function_name,
 extern void blogva(int log_level, const char *format, va_list args);
 
 // Performance monitoring macros
-#define OBS_PERF_START() uint64_t __start_time = obs_get_high_precision_time()
+#define OBS_PERF_START() uint64_t obs_perf_start_time = obs_get_high_precision_time()
 #define OBS_PERF_END_LOG(level, func_name, format, ...) \
     do { \
         uint64_t __end_time = obs_get_high_precision_time(); \
-        obs_log_with_metrics(level, func_name, __end_time - __start_time, format, ##__VA_ARGS__); \
+        obs_log_with_metrics(level, func_name, __end_time - obs_perf_start_time, format, ##__VA_ARGS__); \
     } while(0)
 
 // Memory management utilities
