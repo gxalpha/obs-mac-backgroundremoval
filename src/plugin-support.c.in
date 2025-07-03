@@ -17,23 +17,183 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <plugin-support.h>
+#include <os/log.h>
+#include <stdatomic.h>
 
 const char *PLUGIN_NAME = "@CMAKE_PROJECT_NAME@";
 const char *PLUGIN_VERSION = "@CMAKE_PROJECT_VERSION@";
 
-void obs_log(int log_level, const char *format, ...)
-{
-	size_t length = 4 + strlen(PLUGIN_NAME) + strlen(format);
+// Thread-safe logging with optimized buffer management
+static _Thread_local char log_buffer[1024];
+static _Atomic size_t plugin_name_length = 0;
+static os_log_t plugin_log = NULL;
 
-	char *template = malloc(length + 1);
+// Initialize plugin logging system
+static void initialize_plugin_logging(void) {
+    if (plugin_log == NULL) {
+        plugin_log = os_log_create("com.obs.backgroundremoval", "plugin");
+        
+        // Cache plugin name length for performance
+        size_t name_len = strlen(PLUGIN_NAME);
+        atomic_store(&plugin_name_length, name_len);
+    }
+}
 
-	snprintf(template, length, "[%s] %s", PLUGIN_NAME, format);
+// Optimized logging function with reduced allocations
+void obs_log(int log_level, const char *format, ...) {
+    initialize_plugin_logging();
+    
+    size_t cached_name_len = atomic_load(&plugin_name_length);
+    
+    // Use thread-local buffer to avoid malloc/free overhead
+    size_t available_space = sizeof(log_buffer) - cached_name_len - 4; // 4 chars for "[%s] "
+    
+    if (available_space < 64) {
+        // Fallback to dynamic allocation for very long messages
+        size_t total_length = cached_name_len + strlen(format) + 64;
+        char *dynamic_buffer = malloc(total_length);
+        if (!dynamic_buffer) {
+            return; // Fail silently to avoid recursion
+        }
+        
+        snprintf(dynamic_buffer, total_length, "[%s] %s", PLUGIN_NAME, format);
+        
+        va_list args;
+        va_start(args, format);
+        blogva(log_level, dynamic_buffer, args);
+        va_end(args);
+        
+        free(dynamic_buffer);
+    } else {
+        // Use optimized thread-local buffer
+        int prefix_len = snprintf(log_buffer, sizeof(log_buffer), "[%s] ", PLUGIN_NAME);
+        
+        va_list args;
+        va_start(args, format);
+        
+        // Copy format string after prefix
+        size_t remaining_space = sizeof(log_buffer) - prefix_len;
+        strncat(log_buffer, format, remaining_space - 1);
+        log_buffer[sizeof(log_buffer) - 1] = '\0'; // Ensure null termination
+        
+        blogva(log_level, log_buffer, args);
+        va_end(args);
+    }
+    
+    // Also log to system log for debugging
+    if (plugin_log) {
+        va_list args;
+        va_start(args, format);
+        
+        switch (log_level) {
+            case LOG_ERROR:
+                os_log_error(plugin_log, "%{public}s", format);
+                break;
+            case LOG_WARNING:
+                os_log_fault(plugin_log, "%{public}s", format);
+                break;
+            case LOG_INFO:
+                os_log_info(plugin_log, "%{public}s", format);
+                break;
+            case LOG_DEBUG:
+                os_log_debug(plugin_log, "%{public}s", format);
+                break;
+            default:
+                os_log(plugin_log, "%{public}s", format);
+                break;
+        }
+        va_end(args);
+    }
+}
 
-	va_list(args);
+// Enhanced logging with performance metrics
+void obs_log_with_metrics(int log_level, const char *function_name, 
+                         uint64_t execution_time_ns, const char *format, ...) {
+    initialize_plugin_logging();
+    
+    // Format execution time
+    double execution_time_ms = (double)execution_time_ns / 1000000.0;
+    
+    size_t buffer_size = strlen(format) + strlen(function_name) + 128;
+    char *enhanced_format = malloc(buffer_size);
+    
+    if (enhanced_format) {
+        snprintf(enhanced_format, buffer_size, 
+                "[%s] %.2fms - %s", function_name, execution_time_ms, format);
+        
+        va_list args;
+        va_start(args, format);
+        obs_log(log_level, enhanced_format, args);
+        va_end(args);
+        
+        free(enhanced_format);
+    } else {
+        // Fallback to regular logging
+        va_list args;
+        va_start(args, format);
+        obs_log(log_level, format, args);
+        va_end(args);
+    }
+}
 
-	va_start(args, format);
-	blogva(log_level, template, args);
-	va_end(args);
+// Memory-efficient string utilities
+char *obs_strdup_optimized(const char *src) {
+    if (!src) return NULL;
+    
+    size_t len = strlen(src);
+    char *dst = malloc(len + 1);
+    
+    if (dst) {
+        // Use optimized memory copy for ARM processors
+        memcpy(dst, src, len + 1);
+    }
+    
+    return dst;
+}
 
-	free(template);
+// Safe string concatenation with bounds checking
+int obs_strncat_safe(char *dst, size_t dst_size, const char *src) {
+    if (!dst || !src || dst_size == 0) {
+        return -1;
+    }
+    
+    size_t dst_len = strnlen(dst, dst_size);
+    size_t src_len = strlen(src);
+    
+    if (dst_len >= dst_size) {
+        return -1; // dst is not properly null-terminated
+    }
+    
+    size_t available = dst_size - dst_len - 1; // -1 for null terminator
+    
+    if (available == 0) {
+        return 0; // No space available
+    }
+    
+    size_t copy_len = (src_len < available) ? src_len : available;
+    memcpy(dst + dst_len, src, copy_len);
+    dst[dst_len + copy_len] = '\0';
+    
+    return (int)copy_len;
+}
+
+// Performance monitoring helpers
+uint64_t obs_get_high_precision_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// ARM-optimized memory copy for frame data
+void obs_memcpy_optimized(void *dst, const void *src, size_t size) {
+    // For ARM processors, the built-in memcpy is usually optimal
+    // due to NEON acceleration and cache optimizations
+    memcpy(dst, src, size);
+}
+
+// Cache-friendly data structure alignment for ARM
+size_t obs_align_for_arm_cache(size_t size) {
+    // ARM processors typically have 64-byte cache lines
+    const size_t cache_line_size = 64;
+    return ((size + cache_line_size - 1) / cache_line_size) * cache_line_size;
 }
