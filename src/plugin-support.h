@@ -29,6 +29,8 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 // ARM-specific optimizations
 #ifdef __arm64__

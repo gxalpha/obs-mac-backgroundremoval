@@ -16,7 +16,8 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
-#include <plugin-support.h>
+#include "plugin-support.h"
+#include <obs-module.h>
 #include <os/log.h>
 #include <stdatomic.h>
 
@@ -82,27 +83,24 @@ void obs_log(int log_level, const char *format, ...) {
     
     // Also log to system log for debugging
     if (plugin_log) {
-        va_list args;
-        va_start(args, format);
-        
+        // Use a simple string format to avoid va_list issues with os_log
         switch (log_level) {
             case LOG_ERROR:
-                os_log_error(plugin_log, "%{public}s", format);
+                os_log_error(plugin_log, "Error: %{public}s", format);
                 break;
             case LOG_WARNING:
-                os_log_fault(plugin_log, "%{public}s", format);
+                os_log_fault(plugin_log, "Warning: %{public}s", format);
                 break;
             case LOG_INFO:
-                os_log_info(plugin_log, "%{public}s", format);
+                os_log_info(plugin_log, "Info: %{public}s", format);
                 break;
             case LOG_DEBUG:
-                os_log_debug(plugin_log, "%{public}s", format);
+                os_log_debug(plugin_log, "Debug: %{public}s", format);
                 break;
             default:
                 os_log(plugin_log, "%{public}s", format);
                 break;
         }
-        va_end(args);
     }
 }
 

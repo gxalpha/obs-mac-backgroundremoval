@@ -17,8 +17,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
-#include <plugin-support.h>
+#include "plugin-support.h"
 #include <util/threading.h>
+#include <util/bmem.h>
+#include <graphics/graphics.h>
+#include <graphics/vec3.h>
 #include <Vision/Vision.h>
 #include <Metal/Metal.h>
 #include <IOSurface/IOSurface.h>
@@ -26,6 +29,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <os/signpost.h>
 #include <os/log.h>
 #include <sys/sysctl.h>
+#include <stdatomic.h>
+
+// Define UNUSED_PARAMETER macro if not available
+#ifndef UNUSED_PARAMETER
+#define UNUSED_PARAMETER(x) ((void)(x))
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -106,6 +115,7 @@ struct optimized_vision_data {
     
     // Preset settings
     int quality_preset;
+    int last_quality_preset;
     
     // IOSurface-backed pixel buffers for efficient GPU memory sharing
     CVPixelBufferRef input_pixel_buffer;
@@ -166,34 +176,72 @@ static void detect_arm_processor_capabilities(void) {
 
 // Create IOSurface-backed CVPixelBuffer for efficient GPU memory sharing
 static CVPixelBufferRef create_iosurface_pixel_buffer(uint32_t width, uint32_t height, IOSurfaceRef *out_surface) {
+    if (out_surface) {
+        *out_surface = NULL;
+    }
+    
+    // Validate input parameters
+    if (width == 0 || height == 0 || width > 8192 || height > 8192) {
+        obs_log(LOG_ERROR, "Invalid buffer dimensions: %ux%u", width, height);
+        return NULL;
+    }
+    
     CFMutableDictionaryRef surface_properties = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     
-    CFNumberRef width_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &width);
-    CFNumberRef height_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &height);
-    uint32_t bytes_per_element = 4;
+    if (!surface_properties) {
+        obs_log(LOG_ERROR, "Failed to create surface properties dictionary");
+        return NULL;
+    }
+    
+    int32_t width_int = (int32_t)width;
+    int32_t height_int = (int32_t)height;
+    int32_t bytes_per_element = 4;
+    uint32_t pixel_format = kCVPixelFormatType_32BGRA;
+    
+    CFNumberRef width_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &width_int);
+    CFNumberRef height_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &height_int);
     CFNumberRef bytes_per_element_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bytes_per_element);
+    CFNumberRef pixel_format_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
+    
+    if (!width_number || !height_number || !bytes_per_element_number || !pixel_format_number) {
+        obs_log(LOG_ERROR, "Failed to create CFNumber objects");
+        if (width_number) CFRelease(width_number);
+        if (height_number) CFRelease(height_number);
+        if (bytes_per_element_number) CFRelease(bytes_per_element_number);
+        if (pixel_format_number) CFRelease(pixel_format_number);
+        CFRelease(surface_properties);
+        return NULL;
+    }
     
     CFDictionarySetValue(surface_properties, kIOSurfaceWidth, width_number);
     CFDictionarySetValue(surface_properties, kIOSurfaceHeight, height_number);
     CFDictionarySetValue(surface_properties, kIOSurfaceBytesPerElement, bytes_per_element_number);
-    CFDictionarySetValue(surface_properties, kIOSurfacePixelFormat, CFSTR("BGRA"));
+    CFDictionarySetValue(surface_properties, kIOSurfacePixelFormat, pixel_format_number);
     
     IOSurfaceRef surface = IOSurfaceCreate(surface_properties);
     
     CFRelease(width_number);
     CFRelease(height_number);
     CFRelease(bytes_per_element_number);
-    CFRelease(surface_properties);
+    CFRelease(pixel_format_number);
     
     if (!surface) {
+        obs_log(LOG_ERROR, "Failed to create IOSurface");
+        CFRelease(surface_properties);
         return NULL;
     }
     
     CFMutableDictionaryRef pixel_buffer_attributes = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     
-    CFDictionarySetValue(pixel_buffer_attributes, kCVPixelBufferIOSurfacePropertiesKey, surface_properties);
+    if (!pixel_buffer_attributes) {
+        obs_log(LOG_ERROR, "Failed to create pixel buffer attributes");
+        CFRelease(surface);
+        CFRelease(surface_properties);
+        return NULL;
+    }
+    
     CFDictionarySetValue(pixel_buffer_attributes, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
     
     CVPixelBufferRef pixel_buffer;
@@ -201,13 +249,20 @@ static CVPixelBufferRef create_iosurface_pixel_buffer(uint32_t width, uint32_t h
         kCFAllocatorDefault, surface, pixel_buffer_attributes, &pixel_buffer);
     
     CFRelease(pixel_buffer_attributes);
+    CFRelease(surface_properties);
     
     if (result != kCVReturnSuccess) {
+        obs_log(LOG_ERROR, "Failed to create CVPixelBuffer with IOSurface: %d", result);
         CFRelease(surface);
         return NULL;
     }
     
-    *out_surface = surface;
+    if (out_surface) {
+        *out_surface = surface;
+    } else {
+        CFRelease(surface);
+    }
+    
     return pixel_buffer;
 }
 
@@ -301,6 +356,13 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
     
     struct optimized_vision_data *filter = data;
     
+    if (!filter || !filter->context || !filter->segmentation_request) {
+        if (filter && filter->context) {
+            obs_source_skip_video_filter(filter->context);
+        }
+        return;
+    }
+    
     os_signpost_interval_begin(performance_log, render_signpost_id, "RenderFrame");
 
     obs_source_t *target = obs_filter_get_target(filter->context);
@@ -308,6 +370,7 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
 
     if (!target || !parent) {
         obs_source_skip_video_filter(filter->context);
+        os_signpost_interval_end(performance_log, render_signpost_id, "RenderFrame");
         return;
     }
 
@@ -316,6 +379,7 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
 
     if (width == 0 || height == 0) {
         obs_source_skip_video_filter(filter->context);
+        os_signpost_interval_end(performance_log, render_signpost_id, "RenderFrame");
         return;
     }
     
@@ -337,6 +401,7 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
         
         if (!filter->input_pixel_buffer) {
             obs_source_skip_video_filter(filter->context);
+            os_signpost_interval_end(performance_log, render_signpost_id, "RenderFrame");
             return;
         }
     }
@@ -369,6 +434,7 @@ static void optimized_vision_render(void *data, gs_effect_t *effect) {
         gs_texrender_destroy(render);
         obs_leave_graphics();
         obs_source_skip_video_filter(filter->context);
+        os_signpost_interval_end(performance_log, render_signpost_id, "RenderFrame");
         return;
     }
     
@@ -784,11 +850,11 @@ static void optimized_vision_update(void *data, obs_data_t *settings) {
     
     // Handle quality preset first
     int quality_preset = obs_data_get_int(settings, "quality_preset");
-    static int last_preset = -1;
-    if (quality_preset != last_preset && quality_preset != 5) { // Not Custom
+    if (filter->last_quality_preset != quality_preset && quality_preset != 5) { // Not Custom
         apply_quality_preset(settings, quality_preset);
-        last_preset = quality_preset;
+        filter->last_quality_preset = quality_preset;
     }
+    filter->quality_preset = quality_preset;
     
     // Basic settings
     filter->threshold = (float)obs_data_get_double(settings, "threshold");
@@ -834,6 +900,7 @@ static void optimized_vision_update(void *data, obs_data_t *settings) {
         // Recreate queues with performance core preference
         if (filter->high_priority_queue) {
             dispatch_release(filter->high_priority_queue);
+            filter->high_priority_queue = NULL;
         }
         
         dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
@@ -842,6 +909,12 @@ static void optimized_vision_update(void *data, obs_data_t *settings) {
             0);
         
         filter->high_priority_queue = dispatch_queue_create("com.obs.vision.high_priority", attr);
+        
+        if (!filter->high_priority_queue) {
+            obs_log(LOG_ERROR, "Failed to recreate high priority dispatch queue");
+            // Create fallback queue
+            filter->high_priority_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+        }
     }
     
     // Update shader parameters if effect is loaded
@@ -914,29 +987,56 @@ static void optimized_vision_update(void *data, obs_data_t *settings) {
 static void *optimized_vision_create(obs_data_t *settings, obs_source_t *source) {
     struct optimized_vision_data *filter = bzalloc(sizeof(struct optimized_vision_data));
     
+    if (!filter) {
+        obs_log(LOG_ERROR, "Failed to allocate memory for filter");
+        return NULL;
+    }
+    
     filter->context = source;
-    filter->segmentation_request = [[VNGeneratePersonSegmentationRequest alloc] init];
     
-    // Initialize Metal resources
-    filter->metal_device = MTLCreateSystemDefaultDevice();
-    if (!filter->metal_device) {
-        obs_log(LOG_ERROR, "Failed to create Metal device");
+    // Initialize Vision request
+    @try {
+        filter->segmentation_request = [[VNGeneratePersonSegmentationRequest alloc] init];
+        if (!filter->segmentation_request) {
+            obs_log(LOG_ERROR, "Failed to create VNGeneratePersonSegmentationRequest");
+            goto error_cleanup;
+        }
+    } @catch (NSException *exception) {
+        obs_log(LOG_ERROR, "Vision framework not available: %s", [[exception description] UTF8String]);
         goto error_cleanup;
     }
     
-    filter->metal_command_queue = [filter->metal_device newCommandQueue];
-    if (!filter->metal_command_queue) {
-        obs_log(LOG_ERROR, "Failed to create Metal command queue");
-        goto error_cleanup;
-    }
-    
-    // Create Metal texture cache
-    CVReturn cv_result = CVMetalTextureCacheCreate(
-        kCFAllocatorDefault, NULL, filter->metal_device, NULL, &filter->metal_texture_cache);
-    
-    if (cv_result != kCVReturnSuccess) {
-        obs_log(LOG_ERROR, "Failed to create Metal texture cache");
-        goto error_cleanup;
+    // Initialize Metal resources (may not be available on all systems)
+    @try {
+        filter->metal_device = MTLCreateSystemDefaultDevice();
+        if (!filter->metal_device) {
+            obs_log(LOG_WARNING, "Metal device not available, using fallback mode");
+            // Continue without Metal optimization
+        } else {
+            filter->metal_command_queue = [filter->metal_device newCommandQueue];
+            if (!filter->metal_command_queue) {
+                obs_log(LOG_WARNING, "Failed to create Metal command queue, disabling Metal optimization");
+                [filter->metal_device release];
+                filter->metal_device = nil;
+            } else {
+                // Create Metal texture cache
+                CVReturn cv_result = CVMetalTextureCacheCreate(
+                    kCFAllocatorDefault, NULL, filter->metal_device, NULL, &filter->metal_texture_cache);
+                
+                if (cv_result != kCVReturnSuccess) {
+                    obs_log(LOG_WARNING, "Failed to create Metal texture cache: %d", cv_result);
+                    [filter->metal_command_queue release];
+                    [filter->metal_device release];
+                    filter->metal_command_queue = nil;
+                    filter->metal_device = nil;
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        obs_log(LOG_WARNING, "Metal framework error: %s", [[exception description] UTF8String]);
+        filter->metal_device = nil;
+        filter->metal_command_queue = nil;
+        filter->metal_texture_cache = NULL;
     }
     
     // Create optimized dispatch queues for ARM processors
@@ -946,17 +1046,41 @@ static void *optimized_vision_create(obs_data_t *settings, obs_source_t *source)
     filter->high_priority_queue = dispatch_queue_create(
         "com.obs.vision.high_priority", high_priority_attr);
     
+    if (!filter->high_priority_queue) {
+        obs_log(LOG_ERROR, "Failed to create high priority dispatch queue");
+        goto error_cleanup;
+    }
+    
     dispatch_queue_attr_t processing_attr = dispatch_queue_attr_make_with_qos_class(
         DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0);
     
     filter->processing_queue = dispatch_queue_create(
         "com.obs.vision.processing", processing_attr);
     
+    if (!filter->processing_queue) {
+        obs_log(LOG_ERROR, "Failed to create processing dispatch queue");
+        goto error_cleanup;
+    }
+    
     // Create semaphore for frame synchronization
     filter->frame_semaphore = dispatch_semaphore_create(1);
     
+    if (!filter->frame_semaphore) {
+        obs_log(LOG_ERROR, "Failed to create frame synchronization semaphore");
+        goto error_cleanup;
+    }
+    
     // Cache frequently used objects
-    filter->cached_requests_array = [[NSArray alloc] initWithObjects:filter->segmentation_request, nil];
+    @try {
+        filter->cached_requests_array = [[NSArray alloc] initWithObjects:filter->segmentation_request, nil];
+        if (!filter->cached_requests_array) {
+            obs_log(LOG_ERROR, "Failed to create cached requests array");
+            goto error_cleanup;
+        }
+    } @catch (NSException *exception) {
+        obs_log(LOG_ERROR, "Failed to create cached objects: %s", [[exception description] UTF8String]);
+        goto error_cleanup;
+    }
     
     // Initialize atomic variables
     atomic_store(&filter->frame_counter, 0);
@@ -968,9 +1092,19 @@ static void *optimized_vision_create(obs_data_t *settings, obs_source_t *source)
     // Initialize performance tracking
     filter->last_performance_log_time = obs_get_high_precision_time();
     
+    // Initialize preset tracking
+    filter->last_quality_preset = -1;
+    
     // Load shader effect
     obs_enter_graphics();
     char *effect_file = obs_module_file("alpha_mask.effect");
+    
+    if (!effect_file) {
+        obs_log(LOG_ERROR, "Failed to find alpha_mask.effect file");
+        obs_leave_graphics();
+        goto error_cleanup;
+    }
+    
     filter->composite_effect = gs_effect_create_from_file(effect_file, NULL);
     bfree(effect_file);
     
@@ -980,15 +1114,33 @@ static void *optimized_vision_create(obs_data_t *settings, obs_source_t *source)
         goto error_cleanup;
     }
     
+    // Get shader parameters (some may not exist in older versions)
     filter->source_texture_param = gs_effect_get_param_by_name(filter->composite_effect, "image");
     filter->mask_texture_param = gs_effect_get_param_by_name(filter->composite_effect, "mask");
     filter->threshold_param = gs_effect_get_param_by_name(filter->composite_effect, "threshold");
+    
+    // These parameters are optional for advanced features
     filter->edge_smoothing_param = gs_effect_get_param_by_name(filter->composite_effect, "edge_smoothing");
     filter->contrast_param = gs_effect_get_param_by_name(filter->composite_effect, "contrast");
     filter->brightness_param = gs_effect_get_param_by_name(filter->composite_effect, "brightness");
     filter->blend_mode_param = gs_effect_get_param_by_name(filter->composite_effect, "blend_mode");
     filter->spill_suppression_param = gs_effect_get_param_by_name(filter->composite_effect, "spill_suppression");
     filter->spill_color_param = gs_effect_get_param_by_name(filter->composite_effect, "spill_color");
+    
+    // Verify essential parameters exist
+    if (!filter->source_texture_param || !filter->mask_texture_param || !filter->threshold_param) {
+        obs_log(LOG_ERROR, "Essential shader parameters missing from alpha_mask.effect");
+        obs_leave_graphics();
+        goto error_cleanup;
+    }
+    
+    // Log which optional parameters are available
+    if (filter->edge_smoothing_param) {
+        obs_log(LOG_DEBUG, "Advanced edge smoothing available");
+    }
+    if (filter->spill_suppression_param) {
+        obs_log(LOG_DEBUG, "Spill suppression available");
+    }
     
     obs_leave_graphics();
     
@@ -1013,6 +1165,20 @@ error_cleanup:
     }
     if (filter->cached_requests_array) {
         [filter->cached_requests_array release];
+    }
+    if (filter->high_priority_queue) {
+        dispatch_release(filter->high_priority_queue);
+    }
+    if (filter->processing_queue) {
+        dispatch_release(filter->processing_queue);
+    }
+    if (filter->frame_semaphore) {
+        dispatch_release(filter->frame_semaphore);
+    }
+    if (filter->composite_effect) {
+        obs_enter_graphics();
+        gs_effect_destroy(filter->composite_effect);
+        obs_leave_graphics();
     }
     bfree(filter);
     return NULL;
