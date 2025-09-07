@@ -26,6 +26,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 struct vision_data {
     obs_source_t *context;
+    gs_texrender_t *texrender;
     VNGeneratePersonSegmentationRequest *request;
     gs_effect_t *effect;
     gs_eparam_t *src_param;
@@ -51,25 +52,23 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     struct vision_data *filter = filter_ptr;
 
     /* STEP ZERO: Prepare texrender */
-    obs_enter_graphics();
-    gs_texrender_t *render = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-    obs_leave_graphics();
+    gs_texrender_reset(filter->texrender);
 
     obs_source_t *target = obs_filter_get_target(filter->context);
-    obs_source_t *parent = obs_filter_get_parent(filter->context);
+    const obs_source_t *parent = obs_filter_get_parent(filter->context);
 
-    uint32_t target_flags = obs_source_get_output_flags(target);
+    const uint32_t target_flags = obs_source_get_output_flags(target);
 
-    bool custom_draw = (target_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
-    bool async_source = (target_flags & OBS_SOURCE_ASYNC) != 0;
+    const bool custom_draw = (target_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
+    const bool async_source = (target_flags & OBS_SOURCE_ASYNC) != 0;
 
-    uint32_t width = obs_source_get_base_width(target);
-    uint32_t height = obs_source_get_base_height(target);
+    const uint32_t width = obs_source_get_base_width(target);
+    const uint32_t height = obs_source_get_base_height(target);
 
     /* STEP ONE: Retrieve texture */
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-    if (gs_texrender_begin(render, width, height)) {
+    if (gs_texrender_begin(filter->texrender, width, height)) {
         struct vec4 clear_color;
         vec4_zero(&clear_color);
         gs_clear(GS_CLEAR_COLOR, &clear_color, 0, 0);
@@ -79,14 +78,13 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
         } else {
             obs_source_video_render(target);
         }
-        gs_texrender_end(render);
+        gs_texrender_end(filter->texrender);
     }
     gs_blend_state_pop();
 
     /* STEP TWO: Get source texture */
-    gs_texture_t *source_texture = gs_texrender_get_texture(render);
+    gs_texture_t *source_texture = gs_texrender_get_texture(filter->texrender);
     if (!source_texture) {
-        gs_texrender_destroy(render);
         obs_source_skip_video_filter(filter->context);
         return;
     }
@@ -129,7 +127,6 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     /* Don't render if the output pixel buffer doesn't exist, like before the first frame is processed */
     if (!filter->pixelBufferOut) {
         obs_source_skip_video_filter(filter->context);
-        gs_texrender_destroy(render);
         return;
     }
 
@@ -169,7 +166,6 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
         obs_source_process_filter_tech_end(filter->context, filter->effect, 0, 0, "Draw");
         gs_blend_state_pop();
     }
-    gs_texrender_destroy(render);
 }
 
 static obs_properties_t *vision_properties(void *)
@@ -214,6 +210,7 @@ static void *vision_create(obs_data_t *settings, struct obs_source *source)
     filter->mask_queue = dispatch_queue_create("Filter mask dispatch queue", NULL);
 
     obs_enter_graphics();
+    filter->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
     char *file = obs_module_file("alpha_mask.effect");
     filter->effect = gs_effect_create_from_file(file, NULL);
     bfree(file);
@@ -229,12 +226,13 @@ static void vision_destroy(void *filter_ptr)
 {
     struct vision_data *filter = filter_ptr;
 
+    obs_enter_graphics();
+    gs_texrender_destroy(filter->texrender);
     if (filter->mask_texture) {
-        obs_enter_graphics();
         gs_texture_destroy(filter->mask_texture);
-        obs_leave_graphics();
     }
     gs_effect_destroy(filter->effect);
+    obs_leave_graphics();
     bfree(filter);
 };
 
