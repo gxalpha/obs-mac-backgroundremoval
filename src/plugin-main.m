@@ -27,6 +27,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 struct vision_data {
     obs_source_t *context;
     gs_texrender_t *texrender;
+    gs_stagesurf_t *stagesurf;
     VNGeneratePersonSegmentationRequest *request;
     gs_effect_t *effect;
     gs_eparam_t *src_param;
@@ -92,15 +93,22 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
 
     /* STEP THREE: Creation of new mask */
     /* STEP THREE point one: Create new pixel buffer from source texture */
-    gs_stagesurf_t *stagesurf = gs_stagesurface_create(width, height, format);
-    gs_stage_texture(stagesurf, source_texture);
+    if (filter->stagesurf && (width != gs_stagesurface_get_width(filter->stagesurf) ||
+                              height != gs_stagesurface_get_height(filter->stagesurf))) {
+        gs_stagesurface_destroy(filter->stagesurf);
+        filter->stagesurf = NULL;
+    }
+    if (!filter->stagesurf) {
+        filter->stagesurf = gs_stagesurface_create(width, height, format);
+    }
+    gs_stage_texture(filter->stagesurf, source_texture);
     uint8_t *data;
     uint32_t linesize;
-    gs_stagesurface_map(stagesurf, &data, &linesize);
-    gs_stagesurface_destroy(stagesurf);
+    gs_stagesurface_map(filter->stagesurf, &data, &linesize);
     CVPixelBufferRef pixelBufferIn;
     CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, data, linesize, nil,
                                  nil, nil, &pixelBufferIn);
+    gs_stagesurface_unmap(filter->stagesurf);
 
     /* STEP THREE point two: Dispatch creation of new mask */
     dispatch_async(filter->mask_queue, ^{
@@ -228,6 +236,9 @@ static void vision_destroy(void *filter_ptr)
 
     obs_enter_graphics();
     gs_texrender_destroy(filter->texrender);
+    if (filter->stagesurf) {
+        gs_stagesurface_destroy(filter->stagesurf);
+    }
     if (filter->mask_texture) {
         gs_texture_destroy(filter->mask_texture);
     }
