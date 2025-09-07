@@ -134,17 +134,28 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     }
 
     /* STEP FOUR: Retrieve new mask texture */
-    /* STEP FOUR point one: Destroy old mask texture */
-    if (filter->mask_texture)
-        gs_texture_destroy(filter->mask_texture);
-
-    /* STEP FOUR point two: Get mask texture from pixel buffer */
+    /* STEP FOUR point one: Prepare mask texture */
     pthread_mutex_lock(&filter->pixelBufferMutex);
     CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
+
+    const uint32_t out_width = (uint32_t) CVPixelBufferGetWidth(filter->pixelBufferOut);
+    const uint32_t out_height = (uint32_t) CVPixelBufferGetHeight(filter->pixelBufferOut);
+    if (filter->mask_texture && (out_width != gs_texture_get_width(filter->mask_texture) ||
+                                 out_height != gs_texture_get_height(filter->mask_texture))) {
+        gs_texture_destroy(filter->mask_texture);
+        filter->mask_texture = NULL;
+    }
+
+    if (!filter->mask_texture) {
+        filter->mask_texture =
+            gs_texture_create((uint32_t) out_width, (uint32_t) out_height, GS_A8, 1, NULL, GS_DYNAMIC);
+    }
+
+    /* STEP FOUR point two: Get mask texture from pixel buffer */
     const uint8_t *base_address = CVPixelBufferGetBaseAddress(filter->pixelBufferOut);
-    filter->mask_texture = gs_texture_create((uint32_t) CVPixelBufferGetWidth(filter->pixelBufferOut),
-                                             (uint32_t) CVPixelBufferGetHeight(filter->pixelBufferOut), GS_A8, 1,
-                                             &base_address, 0);
+    const uint32_t bytes_per_row = (uint32_t) CVPixelBufferGetBytesPerRow(filter->pixelBufferOut);
+    gs_texture_set_image(filter->mask_texture, base_address, bytes_per_row, false);
+
     CVPixelBufferUnlockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
     pthread_mutex_unlock(&filter->pixelBufferMutex);
 
@@ -167,9 +178,8 @@ static obs_properties_t *vision_properties(void *)
     obs_properties_add_float_slider(props, "threshold", obs_module_text("Threshold"), 0, 1, 0.05);
     obs_property_t *list = obs_properties_add_list(props, "quality", obs_module_text("Quality"), OBS_COMBO_TYPE_LIST,
                                                    OBS_COMBO_FORMAT_INT);
-    // "Accurate" is currently broken. The resulting mask is fine, but the image when rendered isn't.
-    // obs_property_list_add_int(list, obs_module_text("Quality.Accurate"),
-    //			  VNGeneratePersonSegmentationRequestQualityLevelAccurate);
+    obs_property_list_add_int(list, obs_module_text("Quality.Accurate"),
+                              VNGeneratePersonSegmentationRequestQualityLevelAccurate);
     obs_property_list_add_int(list, obs_module_text("Quality.Balanced"),
                               VNGeneratePersonSegmentationRequestQualityLevelBalanced);
     obs_property_list_add_int(list, obs_module_text("Quality.Fast"),
