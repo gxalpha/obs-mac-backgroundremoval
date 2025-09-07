@@ -4,12 +4,19 @@
 
 This plugin provides an OBS filter to remove a persons background using macOS' built-in [Vision](https://developer.apple.com/documentation/vision) API.
 
-macOS 12 and OBS 28 (or newer) are required.
+This plugin requires OBS 31.1 or later.
 
 ## Getting started
 
-To get started, download and run the installer from the [releases](https://github.com/gxalpha/obs-mac-backgroundremoval/releases) page. It's currently not signed or notarized, so to open it you may have to do `Right Click -> Open` instead of double-clicking and/or allow it in System Settings.
-The filter can be found in the filters window under "Effect Filters". This means that it can be used on any type of source, not just Video Capture Devices.
+To get started, download and run the installer from the [releases](https://github.com/gxalpha/obs-mac-backgroundremoval/releases) page.
+It's currently not signed or notarized.
+Because of that, follow these installation instructions:
+- Open the `.pkg` file that you have downloaded. You will get prompted with a warning, select "Done" (do not move to trash).
+- Open System Settings. Navigate to "Privacy & Security" → "Security". Near the bottom, you will find an information that `obs-mac-backgroundremoval-[...].pkg` was blocked.
+- Click "Open Anyway" and confirm using your administrator login.
+
+The filter can be found in the filters window under "Effect Filters".
+It can be used on any type of source, not just Video Capture Devices!
 
 ## License and Thanks
 This plugin is licensed under the terms of the General Public License, Version 2. You can find the full text in the `LICENSE` file in this repository.
